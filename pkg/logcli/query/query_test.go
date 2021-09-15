@@ -502,7 +502,7 @@ type testQueryClient struct {
 
 func newTestQueryClient(testStreams ...logproto.Stream) *testQueryClient {
 	q := logql.NewMockQuerier(0, testStreams)
-	e := logql.NewEngine(logql.EngineOpts{}, q, logql.NoLimits)
+	e := logql.NewEngine(logql.EngineOpts{}, q, logql.NoLimits, log.NewNopLogger())
 	return &testQueryClient{
 		engine:          e,
 		queryRangeCalls: 0,
