@@ -14,33 +14,34 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	"github.com/grafana/loki/pkg/storage/chunk/cache"
-	util_log "github.com/grafana/loki/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var (
 	cacheCorruptErrs = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_corruptions_total",
 		Help:      "The number of cache corruptions for the index cache.",
 	})
 	cacheHits = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_hits_total",
 		Help:      "The number of cache hits for the index cache.",
 	})
 	cacheGets = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_gets_total",
 		Help:      "The number of gets for the index cache.",
 	})
 	cachePuts = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_puts_total",
 		Help:      "The number of puts for the index cache.",
 	})
 	cacheEncodeErrs = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_encode_errors_total",
 		Help:      "The number of errors for the index cache while encoding the body.",
 	})
@@ -258,7 +259,7 @@ func (s *cachingIndexClient) doQueries(ctx context.Context, queries []Query, cal
 }
 
 func yoloString(buf []byte) string {
-	return *((*string)(unsafe.Pointer(&buf)))
+	return *((*string)(unsafe.Pointer(&buf))) // #nosec G103 -- we know the string is not mutated
 }
 
 // Iterator implements chunk.ReadBatch.
@@ -296,7 +297,6 @@ func isChunksQuery(q Query) bool {
 }
 
 func (s *cachingIndexClient) cacheStore(ctx context.Context, keys []string, batches []ReadBatch) error {
-	logger := util_log.WithContext(ctx, s.logger)
 	cachePuts.Add(float64(len(keys)))
 
 	// We're doing the hashing to handle unicode and key len properly.
@@ -304,9 +304,6 @@ func (s *cachingIndexClient) cacheStore(ctx context.Context, keys []string, batc
 	hashed := make([]string, 0, len(keys))
 	bufs := make([][]byte, 0, len(batches))
 	for i := range keys {
-		if len(batches[i].Entries) != 0 {
-			level.Debug(logger).Log("msg", "caching index entries", "key", keys[i], "count", len(batches[i].Entries))
-		}
 		hashed = append(hashed, cache.HashKey(keys[i]))
 		out, err := proto.Marshal(&batches[i])
 		if err != nil {

@@ -12,13 +12,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/clients/pkg/promtail/client"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/client"
 
-	lokiutil "github.com/grafana/loki/pkg/util"
-	util_log "github.com/grafana/loki/pkg/util/log"
+	lokiutil "github.com/grafana/loki/v3/pkg/util"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
-var testTenantYaml = `
+var testTenantYamlExtractedData = `
 pipeline_stages:
 - json:
     expressions:
@@ -40,7 +40,7 @@ func TestPipelineWithMissingKey_Tenant(t *testing.T) {
 	var buf bytes.Buffer
 	w := log.NewSyncWriter(&buf)
 	logger := log.NewLogfmtLogger(w)
-	pl, err := NewPipeline(logger, loadConfig(testTenantYaml), nil, prometheus.DefaultRegisterer)
+	pl, err := NewPipeline(logger, loadConfig(testTenantYamlExtractedData), nil, prometheus.DefaultRegisterer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,32 +74,58 @@ func TestTenantStage_Validation(t *testing.T) {
 		},
 		"should fail on missing source and value": {
 			config:      &TenantConfig{},
-			expectedErr: lokiutil.StringRef(ErrTenantStageEmptySourceOrValue),
+			expectedErr: lokiutil.StringRef(ErrTenantStageEmptyLabelSourceOrValue),
 		},
 		"should fail on empty source": {
 			config: &TenantConfig{
 				Source: "",
 			},
-			expectedErr: lokiutil.StringRef(ErrTenantStageEmptySourceOrValue),
+			expectedErr: lokiutil.StringRef(ErrTenantStageEmptyLabelSourceOrValue),
 		},
 		"should fail on empty value": {
 			config: &TenantConfig{
 				Value: "",
 			},
-			expectedErr: lokiutil.StringRef(ErrTenantStageEmptySourceOrValue),
+			expectedErr: lokiutil.StringRef(ErrTenantStageEmptyLabelSourceOrValue),
+		},
+		"should fail on empty label": {
+			config: &TenantConfig{
+				Label: "",
+			},
+			expectedErr: lokiutil.StringRef(ErrTenantStageEmptyLabelSourceOrValue),
 		},
 		"should fail on both source and value set": {
 			config: &TenantConfig{
 				Source: "tenant",
 				Value:  "team-a",
 			},
-			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingSourceAndValue),
+			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingLabelSourceAndValue),
+		},
+		"should fail on both source and label set": {
+			config: &TenantConfig{
+				Source: "tenant",
+				Label:  "team-a",
+			},
+			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingLabelSourceAndValue),
+		},
+		"should fail on both label and value set": {
+			config: &TenantConfig{
+				Label: "tenant",
+				Value: "team-a",
+			},
+			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingLabelSourceAndValue),
+		},
+		"should fail on all set": {
+			config: &TenantConfig{
+				Label:  "tenant",
+				Source: "tenant",
+				Value:  "team-a",
+			},
+			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingLabelSourceAndValue),
 		},
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			stage, err := newTenantStage(util_log.Logger, testData.config)
 
@@ -141,6 +167,12 @@ func TestTenantStage_Process(t *testing.T) {
 			inputExtracted: map[string]interface{}{"tenant_id": "bar"},
 			expectedTenant: lokiutil.StringRef("bar"),
 		},
+		"should set the tenant if the label is defined in the label map": {
+			config:         &TenantConfig{Label: "tenant_id"},
+			inputLabels:    model.LabelSet{"tenant_id": "bar"},
+			inputExtracted: map[string]interface{}{},
+			expectedTenant: lokiutil.StringRef("bar"),
+		},
 		"should override the tenant if the source field is defined in the extracted map": {
 			config:         &TenantConfig{Source: "tenant_id"},
 			inputLabels:    model.LabelSet{client.ReservedLabelTenantID: "foo"},
@@ -168,8 +200,6 @@ func TestTenantStage_Process(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			stage, err := newTenantStage(util_log.Logger, testData.config)
 			require.NoError(t, err)

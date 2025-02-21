@@ -1,69 +1,65 @@
-# ⚠️  DEPRECATED - Loki Helm Chart
+# loki
 
-This chart was moved to <https://github.com/grafana/helm-charts>.
+![Version: 6.27.0](https://img.shields.io/badge/Version-6.27.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 3.4.2](https://img.shields.io/badge/AppVersion-3.4.2-informational?style=flat-square)
 
-## Prerequisites
+Helm chart for Grafana Loki and Grafana Enterprise Logs supporting both simple, scalable and distributed modes.
 
-Make sure you have Helm [installed](https://helm.sh/docs/using_helm/#installing-helm) and
-[deployed](https://helm.sh/docs/using_helm/#installing-tiller) to your cluster. Then add
-Loki's chart repository to Helm:
+## Source Code
 
-```bash
-$ helm repo add loki https://grafana.github.io/loki/charts
-```
+* <https://github.com/grafana/loki>
+* <https://grafana.com/oss/loki/>
+* <https://grafana.com/docs/loki/latest/>
 
-You can update the chart repository by running:
+## Requirements
 
-```bash
-$ helm repo update
-```
+| Repository | Name | Version |
+|------------|------|---------|
+| https://charts.min.io/ | minio(minio) | 5.4.0 |
+| https://grafana.github.io/helm-charts | grafana-agent-operator(grafana-agent-operator) | 0.5.1 |
+| https://grafana.github.io/helm-charts | rollout_operator(rollout-operator) | 0.23.0 |
 
-## Deploy Loki only
+Find more information in the Loki Helm Chart [documentation](https://grafana.com/docs/loki/next/installation/helm).
 
-```bash
-$ helm upgrade --install loki loki/loki
-```
+## Contributing and releasing
 
-## Run Loki behind https ingress
+If you made any changes to the [Chart.yaml](https://github.com/grafana/loki/blob/main/production/helm/loki/Chart.yaml) or [values.yaml](https://github.com/grafana/loki/blob/main/production/helm/loki/values.yaml) run `make helm-docs` from the root of the repository to update the documentation and commit the changed files.
 
-If Loki and Promtail are deployed on different clusters you can add an Ingress in front of Loki.
-By adding a certificate you create an https endpoint. For extra security enable basic authentication on the Ingress.
-
-In Promtail set the following values to communicate with https and basic auth
+Futhermore, please add an entry to the [CHANGELOG.md](./CHANGELOG.md) file about what you changed.  This file has a header that looks like this:
 
 ```
-loki:
-  serviceScheme: https
-  user: user
-  password: pass
+[//]: # (<AUTOMATED_UPDATES_LOCATOR> : do not remove this line. This locator is used by the CI pipeline to automatically create a changelog entry for each new Loki release. Add other chart versions and respective changelog entries bellow this line.)
+````
+
+Place your changes as a bulleted list below this header. The helm chart is automatically released once a week, at which point the `CHANGELOG.md` file will be updated to reflect the release of all changes between this header the the header of the previous version as the changes for that weeks release. For example, if the weekly release will be `1.21.0`, and the `CHANGELOG.md` file has the following entries:
+
+```
+[//]: # (<AUTOMATED_UPDATES_LOCATOR> : do not remove this line. This locator is used by the CI pipeline to automatically create a changelog entry for each new Loki release. Add other chart versions and respective changelog entries bellow this line.)
+
+- [CHANGE] Changed the thing
+- [FEATURE] Cool new feature
+
+## 1.20.0
+
+- [BUGFIX] Fixed the bug
 ```
 
-Sample helm template for ingress:
+Then the weekly release will create a `CHANGELOG.md` with the following content:
 ```
-apiVersion: extensions/v1beta1
-kind: Ingress
-metadata:
-annotations:
-    kubernetes.io/ingress.class: {{ .Values.ingress.class }}
-    ingress.kubernetes.io/auth-type: "basic"
-    ingress.kubernetes.io/auth-secret: {{ .Values.ingress.basic.secret }}
-name: loki
-spec:
-rules:
-- host: {{ .Values.ingress.host }}
-    http:
-    paths:
-    - backend:
-        serviceName: loki
-        servicePort: 3100
-tls:
-- secretName: {{ .Values.ingress.cert }}
-    hosts:
-    - {{ .Values.ingress.host }}
+[//]: # (<AUTOMATED_UPDATES_LOCATOR> : do not remove this line. This locator is used by the CI pipeline to automatically create a changelog entry for each new Loki release. Add other chart versions and respective changelog entries bellow this line.)
+
+## 1.21.0
+
+- [CHANGE] Changed the thing
+- [FEATURE] Cool new feature
+
+## 1.20.0
+
+- [BUGFIX] Fixed the bug
 ```
 
-## Use Loki Alerting
+#### Versioning
 
-You can add your own alerting rules with `alerting_groups` in `values.yaml`. This will create a ConfigMap with your rules and additional volumes and mounts for Loki.
-
-This does **not** enable the Loki `ruler` component which does the evaluation of your rules. The `values.yaml` file does contain a simple example. For more details take a look at the official [alerting docs](https://grafana.com/docs/loki/latest/alerting/).
+Normally contributors need _not_ bump the version nor update the [CHANGELOG.md](https://github.com/grafana/loki/blob/main/production/helm/loki/CHANGELOG.md). A new version of the Chart will follow this cadence:
+- Automatic weekly releases
+- Releases that coincide with Loki/GEL releases
+- Manual releases when necessary (ie. to address a CVE or critical bug)

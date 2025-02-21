@@ -16,22 +16,22 @@ package pubsub
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 
-	"go.opencensus.io/plugin/ocgrpc"
+	pb "cloud.google.com/go/pubsub/apiv1/pubsubpb"
+	"cloud.google.com/go/pubsub/internal"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
-	"google.golang.org/api/option"
-	"google.golang.org/grpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
-
-func openCensusOptions() []option.ClientOption {
-	return []option.ClientOption{
-		option.WithGRPCDialOption(grpc.WithStatsHandler(&ocgrpc.ClientHandler{})),
-	}
-}
 
 // The following keys are used to tag requests with a specific topic/subscription ID.
 var (
@@ -93,6 +93,22 @@ var (
 	// StreamResponseCount is a measure of the number of responses received on a streaming-pull stream.
 	// It is EXPERIMENTAL and subject to change or removal without notice.
 	StreamResponseCount = stats.Int64(statsPrefix+"stream_response_count", "Number of gRPC StreamingPull response messages received", stats.UnitDimensionless)
+
+	// OutstandingMessages is a measure of the number of outstanding messages held by the client before they are processed.
+	// It is EXPERIMENTAL and subject to change or removal without notice.
+	OutstandingMessages = stats.Int64(statsPrefix+"outstanding_messages", "Number of outstanding Pub/Sub messages", stats.UnitDimensionless)
+
+	// OutstandingBytes is a measure of the number of bytes all outstanding messages held by the client take up.
+	// It is EXPERIMENTAL and subject to change or removal without notice.
+	OutstandingBytes = stats.Int64(statsPrefix+"outstanding_bytes", "Number of outstanding bytes", stats.UnitDimensionless)
+
+	// PublisherOutstandingMessages is a measure of the number of published outstanding messages held by the client before they are processed.
+	// It is EXPERIMENTAL and subject to change or removal without notice.
+	PublisherOutstandingMessages = stats.Int64(statsPrefix+"publisher_outstanding_messages", "Number of outstanding publish messages", stats.UnitDimensionless)
+
+	// PublisherOutstandingBytes is a measure of the number of bytes all outstanding publish messages held by the client take up.
+	// It is EXPERIMENTAL and subject to change or removal without notice.
+	PublisherOutstandingBytes = stats.Int64(statsPrefix+"publisher_outstanding_bytes", "Number of outstanding publish bytes", stats.UnitDimensionless)
 )
 
 var (
@@ -139,11 +155,29 @@ var (
 	// StreamResponseCountView is a cumulative sum of StreamResponseCount.
 	// It is EXPERIMENTAL and subject to change or removal without notice.
 	StreamResponseCountView *view.View
+
+	// OutstandingMessagesView is the last value of OutstandingMessages
+	// It is EXPERIMENTAL and subject to change or removal without notice.
+	OutstandingMessagesView *view.View
+
+	// OutstandingBytesView is the last value of OutstandingBytes
+	// It is EXPERIMENTAL and subject to change or removal without notice.
+	OutstandingBytesView *view.View
+
+	// PublisherOutstandingMessagesView is the last value of OutstandingMessages
+	// It is EXPERIMENTAL and subject to change or removal without notice.
+	PublisherOutstandingMessagesView *view.View
+
+	// PublisherOutstandingBytesView is the last value of OutstandingBytes
+	// It is EXPERIMENTAL and subject to change or removal without notice.
+	PublisherOutstandingBytesView *view.View
 )
 
 func init() {
 	PublishedMessagesView = createCountView(stats.Measure(PublishedMessages), keyTopic, keyStatus, keyError)
 	PublishLatencyView = createDistView(PublishLatency, keyTopic, keyStatus, keyError)
+	PublisherOutstandingMessagesView = createLastValueView(PublisherOutstandingMessages, keyTopic)
+	PublisherOutstandingBytesView = createLastValueView(PublisherOutstandingBytes, keyTopic)
 	PullCountView = createCountView(PullCount, keySubscription)
 	AckCountView = createCountView(AckCount, keySubscription)
 	NackCountView = createCountView(NackCount, keySubscription)
@@ -153,10 +187,14 @@ func init() {
 	StreamRetryCountView = createCountView(StreamRetryCount, keySubscription)
 	StreamRequestCountView = createCountView(StreamRequestCount, keySubscription)
 	StreamResponseCountView = createCountView(StreamResponseCount, keySubscription)
+	OutstandingMessagesView = createLastValueView(OutstandingMessages, keySubscription)
+	OutstandingBytesView = createLastValueView(OutstandingBytes, keySubscription)
 
 	DefaultPublishViews = []*view.View{
 		PublishedMessagesView,
 		PublishLatencyView,
+		PublisherOutstandingMessagesView,
+		PublisherOutstandingBytesView,
 	}
 
 	DefaultSubscribeViews = []*view.View{
@@ -169,6 +207,8 @@ func init() {
 		StreamRetryCountView,
 		StreamRequestCountView,
 		StreamResponseCountView,
+		OutstandingMessagesView,
+		OutstandingBytesView,
 	}
 }
 
@@ -199,6 +239,16 @@ func createDistView(m stats.Measure, keys ...tag.Key) *view.View {
 	}
 }
 
+func createLastValueView(m stats.Measure, keys ...tag.Key) *view.View {
+	return &view.View{
+		Name:        m.Name(),
+		Description: m.Description(),
+		TagKeys:     keys,
+		Measure:     m,
+		Aggregation: view.LastValue(),
+	}
+}
+
 var logOnce sync.Once
 
 // withSubscriptionKey returns a new context modified with the subscriptionKey tag map.
@@ -214,4 +264,167 @@ func withSubscriptionKey(ctx context.Context, subName string) context.Context {
 
 func recordStat(ctx context.Context, m *stats.Int64Measure, n int64) {
 	stats.Record(ctx, m.M(n))
+}
+
+const defaultTracerName = "cloud.google.com/go/pubsub"
+
+func tracer() trace.Tracer {
+	return otel.Tracer(defaultTracerName, trace.WithInstrumentationVersion(internal.Version))
+}
+
+var _ propagation.TextMapCarrier = (*messageCarrier)(nil)
+
+// messageCarrier injects and extracts traces from pubsub.Message attributes.
+type messageCarrier struct {
+	attributes map[string]string
+}
+
+const googclientPrefix string = "googclient_"
+
+// newMessageCarrier creates a new PubsubMessageCarrier.
+func newMessageCarrier(msg *Message) messageCarrier {
+	return messageCarrier{attributes: msg.Attributes}
+}
+
+// NewMessageCarrierFromPB creates a propagation.TextMapCarrier that can be used to extract the trace
+// context from a protobuf PubsubMessage.
+//
+// Example:
+// ctx = propagation.TraceContext{}.Extract(ctx, pubsub.NewMessageCarrierFromPB(msg))
+func NewMessageCarrierFromPB(msg *pb.PubsubMessage) propagation.TextMapCarrier {
+	return messageCarrier{attributes: msg.Attributes}
+}
+
+// Get retrieves a single value for a given key.
+func (c messageCarrier) Get(key string) string {
+	return c.attributes[googclientPrefix+key]
+}
+
+// Set sets an attribute.
+func (c messageCarrier) Set(key, val string) {
+	c.attributes[googclientPrefix+key] = val
+}
+
+// Keys returns a slice of all keys in the carrier.
+func (c messageCarrier) Keys() []string {
+	i := 0
+	out := make([]string, len(c.attributes))
+	for k := range c.attributes {
+		out[i] = k
+		i++
+	}
+	return out
+}
+
+// injectPropagation injects context data into the Pub/Sub message's Attributes field.
+func injectPropagation(ctx context.Context, msg *Message) {
+	// only inject propagation if a valid span context was detected.
+	if trace.SpanFromContext(ctx).SpanContext().IsValid() {
+		if msg.Attributes == nil {
+			msg.Attributes = make(map[string]string)
+		}
+		propagation.TraceContext{}.Inject(ctx, newMessageCarrier(msg))
+	}
+}
+
+const (
+	// publish span names
+	createSpanName     = "create"
+	publishFCSpanName  = "publisher flow control"
+	batcherSpanName    = "publisher batching"
+	publishRPCSpanName = "publish"
+
+	// subscribe span names
+	subscribeSpanName = "subscribe"
+	ccSpanName        = "subscriber concurrency control"
+	processSpanName   = "process"
+	scheduleSpanName  = "subscribe scheduler"
+	modackSpanName    = "modack"
+	ackSpanName       = "ack"
+	nackSpanName      = "nack"
+
+	// event names
+	eventPublishStart = "publish start"
+	eventPublishEnd   = "publish end"
+	eventModackStart  = "modack start"
+	eventModackEnd    = "modack end"
+	eventAckStart     = "ack start"
+	eventAckEnd       = "ack end"
+	eventNackStart    = "nack start"
+	eventNackEnd      = "nack end"
+	eventAckCalled    = "ack called"
+	eventNackCalled   = "nack called"
+
+	resultAcked   = "acked"
+	resultNacked  = "nacked"
+	resultExpired = "expired"
+
+	// custom pubsub specific attributes
+	gcpProjectIDAttribute  = "gcp.project_id"
+	pubsubPrefix           = "messaging.gcp_pubsub."
+	eosAttribute           = pubsubPrefix + "exactly_once_delivery"
+	resultAttribute        = pubsubPrefix + "result"
+	receiptModackAttribute = pubsubPrefix + "is_receipt_modack"
+)
+
+func startSpan(ctx context.Context, spanType, resourceID string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	spanName := spanType
+	if resourceID != "" {
+		spanName = fmt.Sprintf("%s %s", resourceID, spanType)
+	}
+	return tracer().Start(ctx, spanName, opts...)
+}
+
+func getPublishSpanAttributes(project, dst string, msg *Message, attrs ...attribute.KeyValue) []trace.SpanStartOption {
+	opts := []trace.SpanStartOption{
+		trace.WithAttributes(
+			semconv.MessagingMessageID(msg.ID),
+			semconv.MessagingMessageBodySize(len(msg.Data)),
+			semconv.MessagingGCPPubsubMessageOrderingKey(msg.OrderingKey),
+		),
+		trace.WithAttributes(attrs...),
+		trace.WithSpanKind(trace.SpanKindProducer),
+	}
+	opts = append(opts, getCommonOptions(project, dst)...)
+	return opts
+}
+
+func getSubscriberOpts(project, dst string, msg *Message, attrs ...attribute.KeyValue) []trace.SpanStartOption {
+	opts := []trace.SpanStartOption{
+		trace.WithAttributes(
+			semconv.MessagingMessageID(msg.ID),
+			semconv.MessagingMessageBodySize(len(msg.Data)),
+			semconv.MessagingGCPPubsubMessageOrderingKey(msg.OrderingKey),
+		),
+		trace.WithAttributes(attrs...),
+		trace.WithSpanKind(trace.SpanKindConsumer),
+	}
+	if msg.DeliveryAttempt != nil {
+		opts = append(opts, trace.WithAttributes(semconv.MessagingGCPPubsubMessageDeliveryAttempt(*msg.DeliveryAttempt)))
+	}
+	opts = append(opts, getCommonOptions(project, dst)...)
+	return opts
+}
+
+func getCommonOptions(projectID, destination string) []trace.SpanStartOption {
+	opts := []trace.SpanStartOption{
+		trace.WithAttributes(
+			attribute.String(gcpProjectIDAttribute, projectID),
+			semconv.MessagingSystemGCPPubsub,
+			semconv.MessagingDestinationName(destination),
+		),
+	}
+	return opts
+
+}
+
+// spanRecordError records the error, sets the status to error, and ends the span.
+// This is recommended by https://opentelemetry.io/docs/instrumentation/go/manual/#record-errors
+// since RecordError doesn't set the status of a span.
+func spanRecordError(span trace.Span, err error) {
+	if span != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
+		span.End()
+	}
 }

@@ -1,8 +1,8 @@
 package base
 
 import (
-	"crypto/md5"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 
@@ -10,6 +10,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/spf13/afero"
+	"golang.org/x/crypto/sha3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -60,6 +61,11 @@ func (m *mapper) users() ([]string, error) {
 	var result []string
 
 	dirs, err := afero.ReadDir(m.FS, m.Path)
+	if os.IsNotExist(err) {
+		// The directory may have not been created yet. With regards to this function
+		// it's like the ruler has no tenants and it shouldn't be considered an error.
+		return nil, nil
+	}
 	for _, u := range dirs {
 		if u.IsDir() {
 			result = append(result, u.Name())
@@ -142,11 +148,14 @@ func (m *mapper) writeRuleGroupsIfNewer(groups []rulefmt.RuleGroup, filename str
 		if err != nil {
 			return false, err
 		}
-		newHash := md5.New()
-		currentHash := md5.New()
+		newHash := sha3.New256()
+		currentHash := sha3.New256()
+
+		newHash.Write(d)
+		currentHash.Write(current)
 
 		// bailout if there is no update
-		if string(currentHash.Sum(current)) == string(newHash.Sum(d)) {
+		if string(currentHash.Sum(nil)) == string(newHash.Sum(nil)) {
 			return false, nil
 		}
 	}

@@ -2,14 +2,21 @@ package validation
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
+	dskit_flagext "github.com/grafana/dskit/flagext"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
+
+	"github.com/grafana/loki/v3/pkg/compactor/deletionmode"
+	"github.com/grafana/loki/v3/pkg/compression"
+	"github.com/grafana/loki/v3/pkg/loghttp/push"
+	"github.com/grafana/loki/v3/pkg/logql"
 )
 
 func TestLimitsTagsYamlMatchJson(t *testing.T) {
@@ -63,8 +70,20 @@ split_queries_by_interval: 190s
 ruler_evaluation_delay_duration: 200s
 ruler_max_rules_per_rule_group: 210
 ruler_max_rule_groups_per_tenant: 220
+ruler_remote_write_sigv4_config:
+  region: us-east-1
 per_tenant_override_config: ""
 per_tenant_override_period: 230s
+query_timeout: 5m
+shard_streams:
+  enabled: true
+  desired_rate: 4mb
+  logging_enabled: true
+blocked_queries:
+  - pattern: ".*foo.*"
+    regex: true
+volume_enabled: true
+volume_max_series: 10001
 `
 	inputJSON := `
  {
@@ -96,8 +115,25 @@ per_tenant_override_period: 230s
   "ruler_evaluation_delay_duration": "200s",
   "ruler_max_rules_per_rule_group": 210,
   "ruler_max_rule_groups_per_tenant":220,
+  "ruler_remote_write_sigv4_config": {
+    "region": "us-east-1"
+  },
   "per_tenant_override_config": "",
-  "per_tenant_override_period": "230s"
+  "per_tenant_override_period": "230s",
+  "query_timeout": "5m",
+  "shard_streams": {
+    "desired_rate": "4mb",
+    "enabled": true,
+    "logging_enabled": true
+  },
+  "blocked_queries": [
+	{
+		"pattern": ".*foo.*",
+		"regex": true
+	}
+  ],
+  "volume_enabled": true,
+  "volume_max_series": 10001
  }
 `
 
@@ -142,6 +178,18 @@ func TestLimitsDoesNotMutate(t *testing.T) {
 		defaultLimits = initialDefault
 	}()
 
+	defaultOTLPConfig := push.OTLPConfig{
+		ResourceAttributes: push.ResourceAttributesConfig{
+			IgnoreDefaults: true,
+			AttributesConfig: []push.AttributesConfig{
+				{
+					Action:     push.IndexLabel,
+					Attributes: []string{"pod"},
+				},
+			},
+		},
+	}
+
 	// Set new defaults with non-nil values for non-scalar types
 	newDefaults := Limits{
 		RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"a": "b"}},
@@ -151,6 +199,7 @@ func TestLimitsDoesNotMutate(t *testing.T) {
 				Selector: `{a="b"}`,
 			},
 		},
+		OTLPConfig: defaultOTLPConfig,
 	}
 	SetDefaultLimitsForYAMLUnmarshalling(newDefaults)
 
@@ -166,7 +215,10 @@ ruler_remote_write_headers:
   foo: "bar"
 `,
 			exp: Limits{
+				DiscoverGenericFields:   FieldDetectorConfig{},
 				RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"foo": "bar"}},
+				DiscoverServiceName:     []string{},
+				LogLevelFields:          []string{},
 
 				// Rest from new defaults
 				StreamRetention: []StreamRetention{
@@ -175,6 +227,11 @@ ruler_remote_write_headers:
 						Selector: `{a="b"}`,
 					},
 				},
+				OTLPConfig:                defaultOTLPConfig,
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
 			},
 		},
 		{
@@ -183,7 +240,9 @@ ruler_remote_write_headers:
 ruler_remote_write_headers:
 `,
 			exp: Limits{
-
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
 				// Rest from new defaults
 				StreamRetention: []StreamRetention{
 					{
@@ -191,6 +250,11 @@ ruler_remote_write_headers:
 						Selector: `{a="b"}`,
 					},
 				},
+				OTLPConfig:                defaultOTLPConfig,
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
 			},
 		},
 		{
@@ -201,6 +265,9 @@ retention_stream:
     selector: '{foo="bar"}'
 `,
 			exp: Limits{
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
 				StreamRetention: []StreamRetention{
 					{
 						Period:   model.Duration(24 * time.Hour),
@@ -209,7 +276,12 @@ retention_stream:
 				},
 
 				// Rest from new defaults
-				RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"a": "b"}},
+				RulerRemoteWriteHeaders:   OverwriteMarshalingStringMap{map[string]string{"a": "b"}},
+				OTLPConfig:                defaultOTLPConfig,
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
 			},
 		},
 		{
@@ -218,7 +290,10 @@ retention_stream:
 reject_old_samples: true
 `,
 			exp: Limits{
-				RejectOldSamples: true,
+				RejectOldSamples:      true,
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
 
 				// Rest from new defaults
 				RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"a": "b"}},
@@ -228,6 +303,38 @@ reject_old_samples: true
 						Selector: `{a="b"}`,
 					},
 				},
+				OTLPConfig:                defaultOTLPConfig,
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
+			},
+		},
+		{
+			desc: "per tenant query timeout",
+			yaml: `
+query_timeout: 5m
+`,
+			exp: Limits{
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
+
+				QueryTimeout: model.Duration(5 * time.Minute),
+
+				// Rest from new defaults.
+				RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"a": "b"}},
+				StreamRetention: []StreamRetention{
+					{
+						Period:   model.Duration(24 * time.Hour),
+						Selector: `{a="b"}`,
+					},
+				},
+				OTLPConfig:                defaultOTLPConfig,
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
 			},
 		},
 	} {
@@ -236,6 +343,138 @@ reject_old_samples: true
 			var out Limits
 			require.Nil(t, yaml.UnmarshalStrict([]byte(tc.yaml), &out))
 			require.Equal(t, tc.exp, out)
+		})
+	}
+}
+
+func TestLimitsValidation(t *testing.T) {
+	for _, tc := range []struct {
+		limits   Limits
+		expected error
+	}{
+		{
+			limits:   Limits{DeletionMode: "disabled", BloomBlockEncoding: "none"},
+			expected: nil,
+		},
+		{
+			limits:   Limits{DeletionMode: "filter-only", BloomBlockEncoding: "none"},
+			expected: nil,
+		},
+		{
+			limits:   Limits{DeletionMode: "filter-and-delete", BloomBlockEncoding: "none"},
+			expected: nil,
+		},
+		{
+			limits:   Limits{DeletionMode: "something-else", BloomBlockEncoding: "none"},
+			expected: deletionmode.ErrUnknownMode,
+		},
+		{
+			limits:   Limits{DeletionMode: "disabled", BloomBlockEncoding: "unknown"},
+			expected: fmt.Errorf("invalid encoding: unknown, supported: %s", compression.SupportedCodecs()),
+		},
+	} {
+		desc := fmt.Sprintf("%s/%s", tc.limits.DeletionMode, tc.limits.BloomBlockEncoding)
+		t.Run(desc, func(t *testing.T) {
+			tc.limits.TSDBShardingStrategy = logql.PowerOfTwoVersion.String() // hacky but needed for test
+			tc.limits.TSDBMaxBytesPerShard = DefaultTSDBMaxBytesPerShard
+			if tc.expected == nil {
+				require.NoError(t, tc.limits.Validate())
+			} else {
+				require.ErrorContains(t, tc.limits.Validate(), tc.expected.Error())
+			}
+		})
+	}
+}
+
+func Test_PatternIngesterTokenizableJSONFields(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		expected []string
+	}{
+		{
+			name: "only defaults",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+`,
+			expected: []string{"log", "message"},
+		},
+		{
+			name: "with append",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+pattern_ingester_tokenizable_json_fields_append: msg,body
+`,
+			expected: []string{"log", "message", "msg", "body"},
+		},
+		{
+			name: "with delete",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+pattern_ingester_tokenizable_json_fields_delete: message
+`,
+			expected: []string{"log"},
+		},
+		{
+			name: "with append and delete from default",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+pattern_ingester_tokenizable_json_fields_append: msg,body
+pattern_ingester_tokenizable_json_fields_delete: message
+`,
+			expected: []string{"log", "msg", "body"},
+		},
+		{
+			name: "with append and delete from append",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+pattern_ingester_tokenizable_json_fields_append: msg,body
+pattern_ingester_tokenizable_json_fields_delete: body
+`,
+			expected: []string{"log", "message", "msg"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := Overrides{
+				defaultLimits: &Limits{},
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), overrides.defaultLimits))
+
+			actual := overrides.PatternIngesterTokenizableJSONFields("fake")
+			require.ElementsMatch(t, tc.expected, actual)
+		})
+	}
+}
+
+func Test_MetricAggregationEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		expected bool
+	}{
+		{
+			name: "when true",
+			yaml: `
+metric_aggregation_enabled: true
+`,
+			expected: true,
+		},
+		{
+			name: "when false",
+			yaml: `
+metric_aggregation_enabled: false
+`,
+			expected: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := Overrides{
+				defaultLimits: &Limits{},
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), overrides.defaultLimits))
+
+			actual := overrides.MetricAggregationEnabled("fake")
+			require.Equal(t, tc.expected, actual)
 		})
 	}
 }

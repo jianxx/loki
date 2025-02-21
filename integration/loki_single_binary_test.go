@@ -1,18 +1,23 @@
+//go:build integration
+
 package integration
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/integration/client"
-	"github.com/grafana/loki/integration/cluster"
+	"github.com/grafana/loki/v3/integration/client"
+	"github.com/grafana/loki/v3/integration/cluster"
 )
 
 func TestSingleBinaryIngestQuery(t *testing.T) {
-	clu := cluster.New()
+	clu := cluster.New(nil, cluster.SchemaWithTSDB, func(c *cluster.Cluster) {
+		c.SetSchemaVer("v13")
+	})
 	defer func() {
 		assert.NoError(t, clu.Cleanup())
 	}()
@@ -26,13 +31,14 @@ func TestSingleBinaryIngestQuery(t *testing.T) {
 
 	require.NoError(t, clu.Run())
 
-	tenantID := randStringRunes(12)
-	cli := client.New(tenantID, "", tAll.HTTPURL().String())
+	tenantID := randStringRunes()
+	cli := client.New(tenantID, "", tAll.HTTPURL())
+	now := time.Now()
 
 	t.Run("ingest-logs-store", func(t *testing.T) {
 		// ingest some log lines
-		require.NoError(t, cli.PushLogLineWithTimestamp("lineA", cli.Now.Add(-45*time.Minute), map[string]string{"job": "fake"}))
-		require.NoError(t, cli.PushLogLineWithTimestamp("lineB", cli.Now.Add(-45*time.Minute), map[string]string{"job": "fake"}))
+		require.NoError(t, cli.PushLogLine("lineA", cli.Now.Add(-45*time.Minute), nil, map[string]string{"job": "fake"}))
+		require.NoError(t, cli.PushLogLine("lineB", cli.Now.Add(-45*time.Minute), nil, map[string]string{"job": "fake"}))
 
 		// TODO: Flushing is currently causing a panic, as the boltdb shipper is shared using a global variable in:
 		// https://github.com/grafana/loki/blob/66a4692423582ed17cce9bd86b69d55663dc7721/pkg/storage/factory.go#L32-L35
@@ -41,12 +47,12 @@ func TestSingleBinaryIngestQuery(t *testing.T) {
 
 	t.Run("ingest-logs-ingester", func(t *testing.T) {
 		// ingest some log lines
-		require.NoError(t, cli.PushLogLine("lineC", map[string]string{"job": "fake"}))
-		require.NoError(t, cli.PushLogLine("lineD", map[string]string{"job": "fake"}))
+		require.NoError(t, cli.PushLogLine("lineC", now, nil, map[string]string{"job": "fake"}))
+		require.NoError(t, cli.PushLogLine("lineD", now, nil, map[string]string{"job": "fake"}))
 	})
 
 	t.Run("query", func(t *testing.T) {
-		resp, err := cli.RunRangeQuery(`{job="fake"}`)
+		resp, err := cli.RunRangeQuery(context.Background(), `{job="fake"}`)
 		require.NoError(t, err)
 		assert.Equal(t, "streams", resp.Data.ResultType)
 
@@ -60,13 +66,13 @@ func TestSingleBinaryIngestQuery(t *testing.T) {
 	})
 
 	t.Run("label-names", func(t *testing.T) {
-		resp, err := cli.LabelNames()
+		resp, err := cli.LabelNames(context.Background())
 		require.NoError(t, err)
-		assert.ElementsMatch(t, []string{"__name__", "job"}, resp)
+		assert.ElementsMatch(t, []string{"job"}, resp)
 	})
 
 	t.Run("label-values", func(t *testing.T) {
-		resp, err := cli.LabelValues("job")
+		resp, err := cli.LabelValues(context.Background(), "job")
 		require.NoError(t, err)
 		assert.ElementsMatch(t, []string{"fake"}, resp)
 	})

@@ -7,19 +7,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery"
+	"github.com/prometheus/prometheus/discovery/kubernetes"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
-	"gopkg.in/fsnotify.v1"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/client/fake"
-	"github.com/grafana/loki/clients/pkg/promtail/positions"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/client/fake"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/positions"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
 )
 
 func newTestLogDirectories(t *testing.T) string {
@@ -70,7 +71,7 @@ func newTestFileTargetManager(logger log.Logger, client api.EntryHandler, positi
 	}
 
 	metrics := NewMetrics(nil)
-	ftm, err := NewFileTargetManager(metrics, logger, positions, client, []scrapeconfig.Config{sc}, tc)
+	ftm, err := NewFileTargetManager(metrics, logger, positions, client, []scrapeconfig.Config{sc}, tc, DefaultWatchConig)
 	if err != nil {
 		return nil, err
 	}
@@ -523,6 +524,140 @@ func TestDeadlockStartWatchingDuringSync(t *testing.T) {
 		ftm.syncers[""].sync([]*targetgroup.Group{&tg}, ftm.targetEventHandler)
 	}
 	<-done
+
+	ftm.Stop()
+	ps.Stop()
+}
+
+func TestLabelSetUpdate(t *testing.T) {
+	client := fake.New(func() {})
+	defer client.Stop()
+
+	targetEventHandler := make(chan fileTargetEvent)
+	defer func() {
+		close(targetEventHandler)
+	}()
+
+	syncer := &targetSyncer{
+		metrics:           NewMetrics(nil),
+		log:               log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+		positions:         nil,
+		entryHandler:      client,
+		hostname:          "localhost",
+		fileEventWatchers: make(map[string]chan fsnotify.Event),
+		targets:           make(map[string]*FileTarget),
+		targetConfig: &Config{
+			SyncPeriod: time.Hour,
+		},
+	}
+
+	var target = model.LabelSet{
+		hostLabel: "localhost",
+		pathLabel: "baz",
+		"job":     "foo",
+	}
+
+	var target2 = model.LabelSet{
+		hostLabel: "localhost",
+		pathLabel: "baz",
+		"job":     "foo2",
+	}
+
+	// two separate targets with same path
+	syncer.sync([]*targetgroup.Group{
+		{
+			Targets: []model.LabelSet{target, target2},
+		},
+	}, targetEventHandler)
+	syncer.sendFileCreateEvent(fsnotify.Event{Name: "baz"})
+
+	require.Equal(t, 2, len(syncer.targets))
+	require.Equal(t, 1, len(syncer.fileEventWatchers))
+
+	// remove second target and modify the first
+	target["job"] = "bar"
+	syncer.sync([]*targetgroup.Group{
+		{
+			Targets: []model.LabelSet{target},
+		},
+	}, targetEventHandler)
+
+	require.Equal(t, 1, len(syncer.targets))
+	require.Equal(t, 1, len(syncer.fileEventWatchers))
+
+	// cleanup all targets
+	syncer.sync([]*targetgroup.Group{
+		{
+			Targets: []model.LabelSet{},
+		},
+	}, targetEventHandler)
+	require.Equal(t, 0, len(syncer.targets))
+	require.Equal(t, 0, len(syncer.fileEventWatchers))
+
+}
+
+func TestFulfillKubePodSelector(t *testing.T) {
+	w := log.NewSyncWriter(os.Stderr)
+	logger := log.NewLogfmtLogger(w)
+	logDirName := newTestLogDirectories(t)
+
+	positionsFileName := filepath.Join(logDirName, "positions.yml")
+	ps, err := newTestPositions(logger, positionsFileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := fake.New(func() {})
+	defer client.Stop()
+
+	ftm, err := newTestFileTargetManager(logger, client, ps, logDirName+"/*")
+	assert.NoError(t, err)
+
+	host := "test-host"
+
+	// empty selectors
+	selectors := []kubernetes.SelectorConfig{}
+	expected := []kubernetes.SelectorConfig{
+		{Role: kubernetes.RolePod, Field: fmt.Sprintf("%s=%s", kubernetesPodNodeField, host)},
+	}
+
+	result := ftm.fulfillKubePodSelector(selectors, host)
+	require.Equal(t, expected, result)
+
+	// non-empty selectors with empty field
+	selectors = []kubernetes.SelectorConfig{
+		{Role: kubernetes.RolePod, Field: ""},
+	}
+	expected = []kubernetes.SelectorConfig{
+		{Role: kubernetes.RolePod, Field: fmt.Sprintf("%s=%s", kubernetesPodNodeField, host)},
+	}
+
+	result = ftm.fulfillKubePodSelector(selectors, host)
+	require.Equal(t, expected, result)
+
+	// non-empty selectors with existing field without nodeSelector
+	selectors = []kubernetes.SelectorConfig{
+		{Role: kubernetes.RolePod, Field: "app=frontend"},
+	}
+	expectedField := "app=frontend," + fmt.Sprintf("%s=%s", kubernetesPodNodeField, host)
+	expected = []kubernetes.SelectorConfig{
+		{Role: kubernetes.RolePod, Field: expectedField},
+	}
+
+	result = ftm.fulfillKubePodSelector(selectors, host)
+	require.Equal(t, expected, result)
+
+	// non-empty selectors with existing Field containing nodeSelector
+	nodeSelector := fmt.Sprintf("%s=%s", kubernetesPodNodeField, host)
+	selectors = []kubernetes.SelectorConfig{
+		{Role: kubernetes.RolePod, Field: nodeSelector},
+	}
+	expected = []kubernetes.SelectorConfig{
+		{Role: kubernetes.RolePod, Field: nodeSelector},
+	}
+
+	result = ftm.fulfillKubePodSelector(selectors, host)
+	require.Equal(t, expected, result)
 
 	ftm.Stop()
 	ps.Stop()
